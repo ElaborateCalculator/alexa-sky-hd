@@ -221,7 +221,9 @@ def get_channels():
 """
 
 def get_channels():
-    url = 'http://epgservices.sky.com/5.1.1/api/2.1/region/json/4101/1/'
+    #url = 'http://epgservices.sky.com/5.1.1/api/2.1/region/json/4101/1/'
+    # Irish EPG
+    url = 'http://epgservices.sky.com/5.1.1/api/2.1/region/json/4104/50/'
     a = requests.get(url)
     chan_list = a.json()['init']['channels']
     channels = {}
