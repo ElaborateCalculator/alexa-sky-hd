@@ -13,7 +13,7 @@ import json
 import uuid
 import socket
 from os import environ
-from botocore.vendored import requests
+import requests
 from fuzzywuzzy import fuzz
 # Setup logger
 logger = logging.getLogger()
@@ -203,29 +203,42 @@ def lambda_handler(request, context):
         logger.error(error)
         raise
 
+
 def get_utc_timestamp(seconds=None):
     return time.strftime("%Y-%m-%dT%H:%M:%S.00Z", time.gmtime(seconds))
+
 
 def get_uuid():
     return str(uuid.uuid4())
 
-"""
-def get_channels():   
-    if 'HD' in environ and environ['HD'] == 'True':
-        url = 'https://raw.githubusercontent.com/ndg63276/alexa-sky-hd/master/channels-hd.json'
+
+def get_channels_file(url):
+    if url.startswith('http'):
+        r = requests.get(url)
+        channels = r.json()
     else:
-        url = 'https://raw.githubusercontent.com/ndg63276/alexa-sky-hd/master/channels-sd.json'
-    r=requests.get(url)
-    channels = r.json()
+        with open(url) as f:
+            channels = json.load(f)
     return channels
-"""
+
 
 def get_channels():
-    #url = 'http://epgservices.sky.com/5.1.1/api/2.1/region/json/4101/1/'
-    # Irish EPG
-    url = 'http://epgservices.sky.com/5.1.1/api/2.1/region/json/4104/50/'
-    a = requests.get(url)
-    chan_list = a.json()['init']['channels']
+    if 'CHANNELS_FILE' in environ:
+        url = environ['CHANNELS_FILE']
+    elif 'Italia' in environ:
+        url = 'https://raw.githubusercontent.com/ndg63276/alexa-sky-hd/master/channels-it.json'
+    else:
+        url = 'http://epgservices.sky.com/5.1.1/api/2.1/region/json/4101/1/'
+    channels_json = get_channels_file(url)
+    if 'init' in channels_json:
+        channels = parse_channels_json(channels_json)
+    else:
+        channels = channels_json
+    return channels
+
+
+def parse_channels_json(channels_json):
+    chan_list = channels_json['init']['channels']
     channels = {}
     for chan in chan_list:
         names = []
@@ -247,14 +260,15 @@ def get_channels():
         channels[chan_number] = names
     return channels
 
+
 def get_channel_number(channels, channel_request):
     hd = False
-    if 'HD' in environ and environ['HD'] == True:
+    if 'HD' in environ and environ['HD'] == 'True':
         hd = True
     plus_one_request = False
     if ' plus one' in channel_request:
         plus_one_request = channel_request.replace(' plus one', '')
-    print "plus_one_request: "+str(plus_one_request)
+    print("plus_one_request: "+str(plus_one_request))
     best_score = 0
     best_plus_one_score = 0
     for key in channels.keys():
@@ -263,23 +277,26 @@ def get_channel_number(channels, channel_request):
             if score > best_score:
                 best_score = score
                 channel_number = key
-                print channel_number, score
+                print('normal', channel_number, score)
             if hd:
                 score = fuzz.ratio(chan.lower(), channel_request.lower()+' hd')
                 if score >= best_score:
                     best_score = score
                     channel_number = key
-                    print channel_number, score
+                    print('hd', channel_number, score)
             if plus_one_request:
                 plus_one_score = fuzz.ratio(chan.lower(), plus_one_request.lower())
                 if plus_one_score > best_plus_one_score:
                     best_plus_one_score = plus_one_score
                     plus_one_channel_number = key
-                    print plus_one_channel_number, plus_one_score
+                    print('plus_one', plus_one_channel_number, plus_one_score)
+        if best_score == 100:
+            break
     if plus_one_request:
         if best_plus_one_score > best_score and plus_one_channel_number < 200:
             channel_number = plus_one_channel_number + 100
     return channel_number
+
 
 def handle_discovery(request):
     endpoints = []
@@ -304,6 +321,7 @@ def handle_discovery(request):
 def handle_non_discovery(request):
     request_namespace = request["directive"]["header"]["namespace"]
     request_name = request["directive"]["header"]["name"]
+    endpointId = request['directive']['endpoint']['endpointId']
     namespace = "Alexa"
     name = "Response"
     commands = []
@@ -325,6 +343,12 @@ def handle_non_discovery(request):
             "timeOfSample": get_utc_timestamp(),
             "uncertaintyInMilliseconds": 500
         } ]
+    elif request_namespace == "Alexa.KeypadController":
+        keystroke = request["directive"]["payload"]["keystroke"]
+        if keystroke == "SELECT":
+            commands.append("select")
+        if keystroke == "INFO" or keystroke == "MORE":
+            commands.append("i")
 
     elif request_namespace == "Alexa.PlaybackController":
         if request_name == "Play":
@@ -369,7 +393,6 @@ def handle_non_discovery(request):
                 commands.append('channeldown')
 
     elif request_namespace == "Alexa.SceneController":
-        endpointId = request['directive']['endpoint']['endpointId']
         namespace = request["directive"]["header"]["namespace"]
         if endpointId == "skybox-tvguide":
             if request_name == "Activate":
@@ -425,8 +448,9 @@ def handle_non_discovery(request):
                 name = "DeactivationStarted"       
             commands.append('i')
     for command in commands:
-        send_command(command)
+        send_command(command, endpointId)
     return make_response(request, properties, namespace, name)
+
 
 def make_response(request, properties, namespace, name):       
     response = {
@@ -458,18 +482,22 @@ def make_response(request, properties, namespace, name):
     }
     return response
 
-def send_command(command):
+
+def send_command(command, endpointId=''):
     if command == 'sleep':
         time.sleep(1)
         return
     code=commands[command]
-    commandBytes = [4,1,0,0,0,0,224 + (code/16), code % 16]
+    commandBytes = [4,1,0,0,0,0,224 + int(code/16), code % 16]
     b=bytearray()
     for i in commandBytes:
         b.append(i)
     l = 12
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((environ['HOST'], int(environ['PORT'])))
+    port = int(environ['PORT'])
+    if endpointId == 'skybox-002':
+        port = int(environ['PORT_2'])
+    s.connect((environ['HOST'], port))
     recv=s.recv(64)
     while len(recv)<24:
         s.sendall(recv[0:l])
@@ -483,6 +511,7 @@ def send_command(command):
     s.sendall(b)
     s.close()
 
+
 def get_endpoint(appliance):
     endpoint = {
         "endpointId": appliance["applianceId"],
@@ -495,6 +524,7 @@ def get_endpoint(appliance):
     }
     endpoint["capabilities"] = get_capabilities(appliance)
     return endpoint
+
 
 def get_capabilities(appliance):
     displayCategories = appliance["displayCategories"]
@@ -513,23 +543,32 @@ def get_capabilities(appliance):
                 }
             },
             {  
-                "type":"AlexaInterface",
-                "interface":"Alexa.ChannelController",
-                "version":"1.0",
-                "properties":{  
-                    "supported":[  
-                       { "name":"channel" }
+                "type": "AlexaInterface",
+                "interface": "Alexa.ChannelController",
+                "version": "1.0",
+                "properties": {
+                    "supported": [
+                        { "name":"channel" }
                     ]
                 }
             },
             {  
-                     "type":"AlexaInterface",
-                     "interface":"Alexa.PlaybackController",
-                     "version":"1.0",
-                     "properties":{ },
-                     "supportedOperations" : ["Play", "Pause", "Rewind", "FastForward", "Stop"] 
+                 "type": "AlexaInterface",
+                 "interface": "Alexa.PlaybackController",
+                 "version": "1.0",
+                 "properties": { },
+                 "supportedOperations": ["Play", "Pause", "Rewind", "FastForward", "Stop"]
             },
-
+            {
+                "type": "AlexaInterface",
+                "interface": "Alexa.KeypadController",
+                "version": "3",
+                "keys": [
+                    "INFO", "MORE", "SELECT",
+                    "UP", "DOWN", "LEFT", "RIGHT",
+                    "PAGE_UP", "PAGE_DOWN", "PAGE_LEFT", "PAGE_RIGHT"
+                ]
+            },
         ]
 
     elif displayCategories == ["SCENE_TRIGGER"]:
@@ -563,3 +602,4 @@ def get_capabilities(appliance):
     capabilities.append(endpoint_health_capability)
     capabilities.append(alexa_interface_capability)
     return capabilities
+
